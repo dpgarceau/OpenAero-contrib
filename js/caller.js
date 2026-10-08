@@ -74,14 +74,14 @@ const callerRollText = {
     '4':   'quarter roll',
     '2':   'half roll',
     '3':   'three quarter roll',
-    '1':   'full roll',
-    '5':   'one and a quarter roll',
-    '6':   'one and a half roll',
+    '1':   'one full roll',
+    '5':   'one and quarter roll',
+    '6':   'one and half roll',
     '7':   'one and three quarter roll',
-    '9':   'two rolls',
-    '22':  'two of two point roll',
-    '32':  'three of two point roll',
-    '42':  'four of two point roll',
+    '9':   'two full rolls',
+    '22':  'two half rolls',
+    '32':  'three half rolls',
+    '42':  'four half rolls',
     '24':  'two of four point roll',
     '34':  'three of four point roll',
     '44':  'four of four point roll',
@@ -101,32 +101,32 @@ const callerRollText = {
     // Positive snaps (from posFlickTypes — "flick" → "positive snap")
     '2f':  'half positive snap',
     '3f':  'three quarter positive snap',
-    '1f':  'full positive snap',
-    '5f':  'one and a quarter positive snap',
-    '6f':  'one and a half positive snap',
+    '1f':  'one full positive snap',
+    '5f':  'one and quarter positive snap',
+    '6f':  'one and half positive snap',
     '7f':  'one and three quarter positive snap',
-    '9f':  'two positive snaps',
+    '9f':  'double positive snap',
 
     // Negative snaps (from negFlickTypes — "neg flick" → "negative snap")
     '2if': 'half negative snap',
     '3if': 'three quarter negative snap',
-    '1if': 'full negative snap',
-    '5if': 'one and a quarter negative snap',
-    '6if': 'one and a half negative snap',
+    '1if': 'one full negative snap',
+    '5if': 'one and quarter negative snap',
+    '6if': 'one and half negative snap',
     '7if': 'one and three quarter negative snap',
-    '9if': 'two negative snaps',
+    '9if': 'double negative snap',
 
     // Positive spins (from posSpinTypes)
     '1s':  'one turn positive spin',
-    '5s':  'one and a quarter turn positive spin',
-    '6s':  'one and a half turn positive spin',
+    '5s':  'one and quarter turn positive spin',
+    '6s':  'one and half turn positive spin',
     '7s':  'one and three quarter turn positive spin',
     '9s':  'two turn positive spin',
 
     // Negative spins (from negSpinTypes)
     '1is': 'one turn negative spin',
-    '5is': 'one and a quarter turn negative spin',
-    '6is': 'one and a half turn negative spin',
+    '5is': 'one and quarter turn negative spin',
+    '6is': 'one and half turn negative spin',
     '7is': 'one and three quarter turn negative spin',
     '9is': 'two turn negative spin'
 };
@@ -263,8 +263,41 @@ function getCurveName(degrees) {
     return degrees + ' degree loop';
 }
 
+// isCurveToken - true when the token at idx is an angle drawn as a
+// curve (followed by '=' in the draw string), i.e. a quarter loop
+function isCurveToken(drawString, idx) {
+    const ch = drawString[idx];
+    return callerAngleText[ch] !== undefined &&
+        callerLoopText[ch.toLowerCase()] === undefined &&
+        drawString[idx + 1] === '=';
+}
+
+// getJoinedLoopIndex - returns the index of the next loop element
+// (loop token or curve) that is directly joined to the loop element
+// at idx: no line between them, only visual modifiers and an inside-loop
+// roll (!_). Returns -1 when a line, a roll on a line or anything
+// else follows.
+function getJoinedLoopIndex(drawString, idx) {
+    for (let j = idx + 1; j < drawString.length; j++) {
+        const ch = drawString[j];
+        if (ch === '=' || ch === '/' ||
+            ch === '\u00AB' || ch === '\u00BB') continue;
+        if (ch === '!' && drawString[j + 1] === '_') {
+            j++;
+            continue;
+        }
+        if (callerAngleText[ch] && (callerLoopText[ch.toLowerCase()] ||
+            isCurveToken(drawString, j))) {
+            return j;
+        }
+        return -1;
+    }
+    return -1;
+}
+
 // isAdjacentToLoop - checks if a roll position at rollIndex in the
 // draw string is directly adjacent to a loop token (>= 180°).
+// An angle drawn as a curve (quarter loop) counts as a loop.
 // direction: -1 checks backward (exit), +1 checks forward (entry).
 // Returns false if forward-fly (~, ') or ! separates them.
 function isAdjacentToLoop(drawString, rollIndex, direction) {
@@ -277,8 +310,15 @@ function isAdjacentToLoop(drawString, rollIndex, direction) {
             j += direction;
             continue;
         }
+        // Backward: step over an inside-loop roll (!_) that sits between
+        // this roll position and the loop
+        if (direction === -1 && ch === '_' && drawString[j - 1] === '!') {
+            j -= 2;
+            continue;
+        }
         if (ch === '~' || ch === "'" || ch === '!') return false;
-        if (callerAngleText[ch] && callerLoopText[ch.toLowerCase()]) {
+        if (callerAngleText[ch] && (callerLoopText[ch.toLowerCase()] ||
+            isCurveToken(drawString, j))) {
             return true;
         }
         return false;
@@ -394,6 +434,9 @@ function generateStandardFigureText(figure) {
     let insideLoop = false;
     let pendingEntryRoll = null;
     let lastLoopInfo = null; // {isPull, loopName, entryAtt} for inside-loop rolls
+    let mergedCurvePending = false; // true after a curve that merges into the next half loop
+    let mergedCurveIdx = -1; // index of a curve already merged into the previous half loop
+    let lastPartHasInsideRoll = false; // true when the last loop part carries an inside-loop roll
 
     // Detect spin entry: first real roll section contains a spin type
     const isSpinEntry = hasSpinInSection(figure.rolls[startRollIdx]);
@@ -437,30 +480,83 @@ function generateStandardFigureText(figure) {
                 continue;
             }
 
+            // A curve that was already called as part of the previous
+            // half loop (three quarter loop): attitude is updated above,
+            // no text
+            if (i === mergedCurveIdx) {
+                mergedCurveIdx = -1;
+                insideLoop = false;
+                continue;
+            }
+
             // Check if this angle is drawn as a curve (followed by '=')
             // making it a loop-like element (e.g., V= = quarter loop in P-loops)
-            const isCurve = !isLoop &&
-                (i + 1 < drawString.length) && drawString[i + 1] === '=';
+            const isCurve = !isLoop && isCurveToken(drawString, i);
+
+            // Find a loop element directly joined to this one (no line
+            // between them) and whether it is flown the same way
+            const joinedIdx = (isLoop || isCurve) ?
+                getJoinedLoopIndex(drawString, i) : -1;
+            const joinedCh = (joinedIdx >= 0) ? drawString[joinedIdx] : '';
+            const joinedSameWay = (joinedIdx >= 0) &&
+                ((joinedCh === joinedCh.toLowerCase()) === isPull);
+
+            // A quarter loop directly followed by a half loop flown the
+            // same way is one three quarter loop. It is called at the
+            // half loop, so no text here. A pending entry roll stays
+            // pending for that loop.
+            if (isCurve && callerAngleText[ch].degrees === 90 &&
+                joinedSameWay && joinedCh.toLowerCase() === 'm') {
+                mergedCurvePending = true;
+                insideLoop = false;
+                continue;
+            }
 
             let text;
             if (isLoop || isCurve) {
                 const direction = isPull ? 'inside' : 'outside';
-                const loopName = isCurve ?
+                let loopName = isCurve ?
                     getCurveName(callerAngleText[ch].degrees) :
                     callerLoopText[ch.toLowerCase()];
+                // exitAtt and exitIdx describe where this loop element
+                // ends, for the exit line position
+                let exitAtt = attitude;
+                let exitIdx = i;
+                if (ch.toLowerCase() === 'm') {
+                    if (mergedCurvePending) {
+                        // quarter loop + half loop
+                        loopName = callerLoopText['p'];
+                    } else if (joinedSameWay &&
+                        isCurveToken(drawString, joinedIdx) &&
+                        callerAngleText[joinedCh].degrees === 90) {
+                        // half loop + quarter loop: the curve is called
+                        // here and skipped when the walker reaches it
+                        loopName = callerLoopText['p'];
+                        mergedCurveIdx = joinedIdx;
+                        exitAtt = (((attitude + OA.drawAngles[joinedCh]) % 360) + 360) % 360;
+                        exitIdx = joinedIdx;
+                    }
+                }
+                mergedCurvePending = false;
                 text = (isPull ? 'Pull ' : 'Push ') +
                     direction + ' ' + loopName;
-                // Add exit line position for loops that don't end horizontal
-                if (state.linePosition !== 'horizontal') {
-                    text += ' to ' + state.linePosition;
+                // Add exit line position for loops that don't end horizontal.
+                // Not when another loop element is directly joined: there
+                // is no line between them.
+                const joinsNext = getJoinedLoopIndex(drawString, exitIdx) >= 0;
+                if (!joinsNext &&
+                    getCallerState(exitAtt).linePosition !== 'horizontal') {
+                    text += ' to ' + getCallerState(exitAtt).linePosition;
                 }
                 // Store loop info for potential inside-loop roll
                 lastLoopInfo = {
                     isPull: isPull,
                     loopName: loopName,
                     entryAtt: (((attitude - OA.drawAngles[ch]) % 360) + 360) % 360,
-                    exitAtt: attitude
+                    exitAtt: exitAtt,
+                    joinsNext: joinsNext
                 };
+                lastPartHasInsideRoll = false;
             } else if (isLastGeo) {
                 // Rule 20: fold exit attitude into the last angle token.
                 // Include crossbox if the figure exits on Y axis.
@@ -480,7 +576,7 @@ function generateStandardFigureText(figure) {
             }
 
             // If there's a pending entry roll, combine with this geometry
-            if (pendingEntryRoll && isLoop) {
+            if (pendingEntryRoll && (isLoop || isCurve)) {
                 text = pendingEntryRoll + ' on entry, ' + text;
                 pendingEntryRoll = null;
             } else if (pendingEntryRoll) {
@@ -571,8 +667,10 @@ function generateStandardFigureText(figure) {
                     // comma-combination with the following loop
                     pendingEntryRoll = rollText;
                 } else if (placement === 'loopExit') {
-                    // Roll directly after loop — comma-append
-                    if (parts.length > 0) {
+                    // Roll directly after loop — comma-append, unless
+                    // the loop already carries an inside-loop roll: then
+                    // keep the exit roll as a separate part
+                    if (parts.length > 0 && !lastPartHasInsideRoll) {
                         parts[parts.length - 1] += ', ' +
                             rollText + ' on exit';
                     } else {
@@ -604,7 +702,8 @@ function generateStandardFigureText(figure) {
                             if (exitAtt < 0) exitAtt += 360;
                         }
                         const exitState = getCallerState(exitAtt);
-                        const exitSuffix = (exitState.linePosition !== 'horizontal') ?
+                        const exitSuffix = (!lastLoopInfo.joinsNext &&
+                            exitState.linePosition !== 'horizontal') ?
                             ' to ' + exitState.linePosition : '';
                         const loopText = force + direction +
                             lastLoopInfo.loopName + exitSuffix +
@@ -621,6 +720,7 @@ function generateStandardFigureText(figure) {
                         } else {
                             parts[parts.length - 1] = loopText;
                         }
+                        lastPartHasInsideRoll = true;
                     } else {
                         parts.push(rollText);
                     }
@@ -703,9 +803,10 @@ function generateFamily2Text(figure) {
     const turnMatch = pattern.match(/j(io|oi|o)?(\d*)/i);
     let turnType = '';
     let rollDigits = '';
+    let modifier = '';
 
     if (turnMatch) {
-        const modifier = (turnMatch[1] || '').toLowerCase();
+        modifier = (turnMatch[1] || '').toLowerCase();
         rollDigits = turnMatch[2] || '';
 
         if (modifier === 'io') {
@@ -713,15 +814,15 @@ function generateFamily2Text(figure) {
         } else if (modifier === 'oi') {
             turnType = 'alternating outside inside';
         } else if (modifier === 'o') {
-            turnType = 'outside';
+            turnType = 'to the outside';
         } else if (rollDigits) {
-            turnType = 'inside';
+            turnType = 'to the inside';
         }
     }
 
     // Build turn text — no-roll variant is an "aerobatic turn"
     // Rolling turns split into two parts for clarity:
-    //   "270 degree rolling turn.. Three rolls inside.."
+    //   "270 degree rolling turn.. three rolls to the inside.."
     // instead of the tongue-twister:
     //   "270 degree inside rolling turn with three rolls.."
     if (!rollDigits) {
@@ -730,6 +831,23 @@ function generateFamily2Text(figure) {
 
     const parts = [];
     parts.push(turnAngle + ' degree rolling turn');
+
+    // Alternating turn with a half roll (jio15, joi51 and variants):
+    // name each part in the order flown, since the total alone does
+    // not say which part comes first, e.g.
+    //   "alternating half roll outside, one roll inside"
+    if ((modifier === 'io' || modifier === 'oi') &&
+        rollDigits.indexOf('5') >= 0) {
+        const dirs = (modifier === 'io') ?
+            ['inside', 'outside'] : ['outside', 'inside'];
+        const segments = [];
+        for (let i = 0; i < rollDigits.length; i++) {
+            segments.push(getTurnRollText(rollDigits[i]) + ' ' +
+                dirs[i % 2]);
+        }
+        parts.push('alternating ' + segments.join(', '));
+        return parts.join('.. ');
+    }
 
     // Roll description with direction as suffix
     const rollDesc = getTurnRollText(rollDigits);
@@ -758,7 +876,8 @@ function getTurnRollText(digits) {
     };
 
     if (whole === 0 && hasHalf) return 'half roll';
-    if (whole === 1 && !hasHalf) return 'full roll';
+    if (whole === 1 && !hasHalf) return 'one roll';
+    if (whole === 1 && hasHalf) return 'one and half roll';
     if (hasHalf) {
         return (wholeText[whole] || whole) +
             ' and a half rolls';
